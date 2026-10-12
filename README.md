@@ -91,6 +91,57 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+## Self-hosted decision models
+
+Two local servers implement the same `POST /v1/systemone` wire protocol as the hosted TypeSafe API, so `TYPESAFE_BASE_URL` is the only switch needed. Only the decision model changes; `TEXT_MODEL_API_KEY` is still an OpenAI-compatible helper for `TYPE_TEXT` values unless you point it at your own server.
+
+| Backend | Start it | `.env` |
+| --- | --- | --- |
+| [laya](https://github.com/NandhaKishorM/laya) — recommended | `pip install "laya[serve]"` then `LAYA_DEVICE=cuda LAYA_MODELS=typed-decisions laya-serve` | `TYPESAFE_BASE_URL=http://127.0.0.1:8000`<br>`TYPESAFE_PROFILE=laya` |
+| [jeff](https://github.com/logan-markewich/jeff) | `uv sync --extra dev`, `uv run hf download knowledgator/gliformer-large-v1 --local-dir models/gliformer-large-v1`, then `JEFF_API_KEYS=devkey JEFF_WARMUP=1 uv run jeff` | `TYPESAFE_BASE_URL=http://127.0.0.1:8000`<br>`TYPESAFE_PROFILE=jeff` |
+
+```bash
+TYPESAFE_BASE_URL=http://127.0.0.1:8000
+TYPESAFE_PROFILE=laya
+TYPESAFE_API_KEY=devkey
+```
+
+The `hosted` profile stays the default and is unchanged upstream behaviour: nothing ranked, nothing dropped, full policy text, `TYPESAFE_MODEL=jev-latest`.
+
+### Read this before you expect it to work
+
+Both backends answer correctly and confidently when the answer is **present in the page text**. Neither one reliably follows this agent's policy, and that is a model-capability limit, not a configuration problem. On six realistic Google Flights states, scored against the move a careful person would make:
+
+| Backend | Correct | Operator confidence |
+| --- | --- | --- |
+| Hosted TypeSafe | runs the task | calibrated |
+| laya `typed-decisions` | 1 / 6 | 0.05 – 0.08 |
+| jeff `gliformer-large-v1` | 0 / 6 | 0.08 |
+
+jeff's six answers were the *same distribution* on six different pages (`SELECT` .21 / `CLICK` .21 / `BLOCKED` .21), which is what a model with no signal looks like. Probing jeff directly shows why: asked which city is France's capital it answers `paris` at 0.94, and still 0.95 when the options are reordered, but asked how much change Marie got it answers `14` — the ticket price, the most salient number — rather than `8`. It reads documents; it does not reason over one. This agent asks the harder question: the right control for "Where from?" when the goal says "Zurich" and the field label shares no word with it.
+
+**To run this agent on a local model you need to fine-tune it on this policy.** laya is the better starting point: it is 421M instead of 2.3 GB, 33 ms instead of 3 s per decision, and it already documents a fine-tuning path that took its own decision benchmark from 0.362 to 0.766. Until then treat a local backend as a working transport and a policy you still have to teach.
+
+### Why the profiles exist
+
+A self-hosted System 1 encoder does not tolerate what the hosted API does, and the failure is silent. Measured on a real Google Flights page (140 result links, a 140-option dropdown, three fields), the unbudgeted payload is a 53 KB request with a 145-option click head and a 32,579-character state. Against jeff that is refused twice over: **HTTP 422** above 64 options per head, and again above 20,000 characters. On a 4 GB card it can instead answer **HTTP 500** from a CUDA out-of-memory, because eager attention is quadratic in the prompt — measured, 2,385 tokens is fine, a 13,689-character state tries to allocate 572 MB and dies, and the server stays broken afterwards.
+
+laya fails differently and just as quietly: it trims **each question to 256 tokens**, and it trims the *instructions* first. This agent inlines its policy into every head, so on laya the policy is silently deleted and the model is left with bare options. Removing the rules from three heads by hand changed the token count by 53 and the answer not at all — proof they were never being read.
+
+So a profile bounds and ranks what is offered:
+
+| Setting | `hosted` | `jeff` | `laya` | What it does |
+| --- | --- | --- | --- | --- |
+| `ELEMENT_BUDGET` | `0` | `16` | `8` | Actions offered across all heads, ranked by goal relevance |
+| `OPTION_BUDGET` | `0` | `4` | `2` | Values kept per `<select>` |
+| `STATE_CHARS` | `0` | `6000` | `800` | Page text is halved until the serialized state fits |
+| `RULES` | full | `compact` | `terse` | Which policy text to inline (`full`/`compact`/`terse`) |
+| `MODEL` | `jev-latest` | `jev-latest` | `typed-decisions` | Default model name; laya needs a real checkpoint name |
+
+Ranking never removes the only route to a value: `fill` and `select` nodes are offered ahead of better-matching links, and a field keeps both its `TYPE_TEXT` and its "Open …" `CLICK`. Every setting is an independent `TYPESAFE_*` override, and `0` restores the unbounded hosted behaviour.
+
+On the jeff side, `JEFF_MAX_BATCH=1` and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` keep a small GPU from fragmenting, and its `JEFF_MAX_LABELS` / `JEFF_MAX_STATE_CHARS` can be raised if you also raise the matching budget above.
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.
@@ -135,7 +186,7 @@ node --check jev_ultrafast/snapshot.js
 uv build
 ```
 
-Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
+Tests are offline. `tests/test_agent.py` asserts that the `jeff` and `laya` profiles each fit their backend's limits and that the `hosted` profile is unchanged, and ends with one opt-in end-to-end check that runs only against a server named by `JEV_TEST_JEFF_URL` (default `http://127.0.0.1:8000`) and skips when it is unreachable or is not a jeff, so it never reaches the paid API. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. Live examples and recording scripts make paid API calls. `scripts/record_flights.py <new-folder>` captures original browser timestamps; `scripts/render_demo.py <recording-folder>` renders that verified run at 1× and crops out the Google account strip. Credentials and raw traces stay ignored.
 
 ---
 

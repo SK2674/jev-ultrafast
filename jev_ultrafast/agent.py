@@ -46,7 +46,8 @@ class Agent:
     def snapshot(self):
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
-            "elements": action_space(self.state["page"]["actions"])[0],
+            # The same budgeted table choose() sends, so inspector numbers match the model's.
+            "elements": action_space(self.state["page"]["actions"], self.state["goal"])[0],
         }
 
     def command(self, name, body=None):

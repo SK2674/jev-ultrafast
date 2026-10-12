@@ -1,10 +1,13 @@
 """Offline contracts for a dynamic operation/target policy. No paid APIs."""
 
+import contextlib
 import json
+import os
 import time
 from copy import deepcopy
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from jev_ultrafast import agent as loop
@@ -31,6 +34,65 @@ def page():
 
 def choice(ids, selected):
     return {"choice": selected, "confidence": 1.0, "probabilities": {i: float(i == selected) for i in ids}}
+
+
+# The limits a self-hosted jeff server enforces before it will answer (JEFF_MAX_*).
+JEFF_MAX_LABELS = 64
+JEFF_MAX_STATE_CHARS = 20000
+JEFF_MAX_QUESTIONS = 64
+
+
+def crowded_page(clicks=140, options=140):
+    """A page like a real results list: two fields, a long dropdown, and many links."""
+    actions = []
+    for i, label in enumerate(["Where from?", "Where to?", "Departure"]):
+        actions.append({"id": f"f{i}", "kind": "fill", "label": label, "role": "textbox", "value": "", "node": 10 + i})
+        actions.append({"id": f"o{i}", "kind": "click", "label": f"Open {label}", "role": "textbox",
+                        "value": "", "node": 10 + i})
+    for o in range(options):
+        actions.append({"id": f"s{o}", "kind": "select", "label": f"Cabin class → Zurich {o}",
+                        "role": "combobox", "value": f"z{o}", "current_value": "Economy", "node": 50})
+    for c in range(clicks):
+        actions.append({"id": f"c{c}", "kind": "click", "label": f"Flight result {c} nonstop London",
+                        "role": "button", "value": "", "node": 200 + c})
+    actions.append({"id": "scroll_down", "kind": "scroll", "label": "Scroll down", "delta": 560})
+    actions.append({"id": "wait", "kind": "wait", "label": "Wait for the page to update"})
+    return {
+        "url": "https://example.test/flights", "title": "Flights",
+        "text": " ".join(f"copy line {i} about cheap flights" for i in range(120)),
+        "actions": actions, "fingerprint": "x",
+    }
+
+
+def goals():
+    return "Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy."
+
+
+def jeff(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_PROFILE", "jeff")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "devkey")
+    monkeypatch.setenv("TYPESAFE_BASE_URL", "http://127.0.0.1:8000")
+
+
+def sent_body(monkeypatch, page, goal=None):
+    """Run choose() against a stub backend and return the request it would have sent."""
+    bodies = []
+
+    def post(_url, _key, body):
+        bodies.append(body)
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "TYPE_TEXT"),
+                "type_text_target": choice(body["questions"]["type_text_target"]["criteria"], "1"),
+            },
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    with contextlib.suppress(ValueError):
+        model.choose(page, goal or goals(), [])
+    return bodies[0]
 
 
 def decision(action="e1"):
@@ -318,3 +380,200 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+# --- Running the agent on a self-hosted jeff (TYPESAFE_PROFILE=jeff) ----------------
+
+
+def test_unbudgeted_request_is_exactly_what_a_self_hosted_server_refuses(monkeypatch):
+    """The premise: upstream's full table overruns jeff's documented limits, so it 422s."""
+    body = sent_body(monkeypatch, crowded_page())
+    assert max(len(q["criteria"]) for q in body["questions"].values()) > JEFF_MAX_LABELS
+    assert model.state_size(body["state"]) > JEFF_MAX_STATE_CHARS
+
+
+def test_jeff_profile_request_fits_every_limit_a_self_hosted_server_enforces(monkeypatch):
+    jeff(monkeypatch)
+    body = sent_body(monkeypatch, crowded_page())
+    for name, question in body["questions"].items():
+        assert len(question["criteria"]) <= JEFF_MAX_LABELS, name
+    assert len(body["questions"]) <= JEFF_MAX_QUESTIONS
+    assert model.state_size(body["state"]) <= JEFF_MAX_STATE_CHARS
+
+
+def test_fields_are_offered_before_better_matching_result_links(monkeypatch):
+    """'Where from?' shares no non-stopword with the goal, but typing is the only route to a value."""
+    jeff(monkeypatch)
+    body = sent_body(monkeypatch, crowded_page())
+    fields = body["questions"]["type_text_target"]["criteria"]
+    links = body["questions"]["click_target"]["criteria"]
+    assert len(fields) == 3
+    assert "London" in json.dumps(links)  # the 140 result links match the goal; the fields match nothing
+    assert not any("London" in c["element"] for c in fields.values())
+    # The fields lead the click head too, so 'Open ...' is still offered next to its own field.
+    assert list(links)[:3] == list(fields)
+
+
+def test_bounded_action_space_keeps_a_field_whole(monkeypatch):
+    """A field's fill and its 'Open ...' click are one choice; splitting them breaks both routes."""
+    jeff(monkeypatch)
+    body = sent_body(monkeypatch, crowded_page())
+    elements = body["state"]["elements"]
+    assert [e["operations"] for e in elements[1:4]] == [["TYPE_TEXT", "CLICK"]] * 3
+    offered = sum(len(e.get("options") or e["operations"]) for e in elements)
+    assert offered == model.settings()["ELEMENT_BUDGET"]
+
+
+def test_dropdown_values_are_capped_and_most_relevant_first(monkeypatch):
+    """A 140-option <select> overruns JEFF_MAX_LABELS on its own; goal words pick the survivors."""
+    jeff(monkeypatch)
+    body = sent_body(monkeypatch, crowded_page())
+    options = next(e for e in body["state"]["elements"] if e.get("options"))["options"]
+    assert len(options) == model.settings()["OPTION_BUDGET"]
+    goal = model.terms(goals())
+    assert options[0] is max(options, key=lambda o: len(goal & model.terms(o["label"])))
+
+
+def test_hosted_profile_still_offers_every_control_in_dom_order(monkeypatch):
+    """The default profile must stay upstream behaviour: nothing ranked away, nothing dropped."""
+    body = sent_body(monkeypatch, crowded_page())
+    assert [e["label"] for e in body["state"]["elements"]][:4] == [
+        "Where from?", "Where to?", "Departure", "Cabin class",
+    ]
+    assert len(body["state"]["elements"]) == 144  # 3 fields + 1 dropdown + 140 result links
+    heads = {name: len(q["criteria"]) for name, q in body["questions"].items()}
+    assert (heads["click_target"], heads["select_target"], heads["type_text_target"]) == (143, 140, 3)
+    assert {"DONE", "BLOCKED", "SCROLL_DOWN", "WAIT"} <= set(body["questions"]["operation"]["criteria"])
+
+
+def test_profile_env_overrides_beat_the_profile_default(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_PROFILE", "jeff")
+    monkeypatch.setenv("TYPESAFE_ELEMENT_BUDGET", "3")
+    assert model.settings() == {"ELEMENT_BUDGET": 3, "OPTION_BUDGET": 4, "STATE_CHARS": 6000,
+                                "RULES": "compact", "MODEL": ""}
+    monkeypatch.setenv("TYPESAFE_RULES", "terse")
+    assert model.settings()["RULES"] == "terse"
+    monkeypatch.setenv("TYPESAFE_PROFILE", "hosted")
+    monkeypatch.setenv("TYPESAFE_ELEMENT_BUDGET", "0")
+    assert model.settings()["ELEMENT_BUDGET"] is False  # 0 restores the unbounded hosted behaviour
+
+
+def test_laya_profile_names_its_checkpoint_and_keeps_rules_short(monkeypatch):
+    """laya ignores an unknown model name and trims instructions before options, so both matter."""
+    monkeypatch.setenv("TYPESAFE_PROFILE", "laya")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.delenv("TYPESAFE_MODEL", raising=False)
+    monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
+    body = sent_body(monkeypatch, crowded_page())
+    assert body["model"] == "typed-decisions"
+    assert body["questions"]["operation"]["instructions"]["rules"] is model.NEXT_ACTION_TERSE
+    # laya's cap is 256 tokens per question, shared with that question's options.
+    head = body["questions"]["click_target"]
+    per_head = len(" ".join(head["instructions"]["rules"]))
+    widest = max(len(q["criteria"]) for q in body["questions"].values())
+    assert widest <= model.settings()["ELEMENT_BUDGET"]
+    assert per_head * 3 < len(model.NEXT_ACTION)
+
+
+def test_explicit_model_env_beats_the_profile_default(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_PROFILE", "laya")
+    monkeypatch.setenv("TYPESAFE_MODEL", "multilingual")
+    assert sent_body(monkeypatch, page())["model"] == "multilingual"
+
+
+def test_base_url_points_the_agent_at_a_local_server(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
+    assert model.systemone_url() == "https://api.typesafe.ai/v1/systemone"
+    monkeypatch.setenv("TYPESAFE_BASE_URL", "http://127.0.0.1:8000/")
+    assert model.systemone_url() == "http://127.0.0.1:8000/v1/systemone"
+
+
+def test_page_text_is_halved_until_the_state_fits(monkeypatch):
+    monkeypatch.setenv("TYPESAFE_PROFILE", "jeff")
+    p = crowded_page()
+    p["text"] = "chatty page copy. " * 2000
+    body = sent_body(monkeypatch, p)
+    sent = body["state"]["page"]["text"]
+    assert 0 < len(sent) < len(p["text"])
+    assert p["text"].startswith(sent)  # only ever truncated, never rewritten
+    assert model.state_size(body["state"]) <= model.settings()["STATE_CHARS"]
+
+
+def test_compact_rules_keep_every_hard_constraint(monkeypatch):
+    jeff(monkeypatch)
+    body = sent_body(monkeypatch, crowded_page())
+    rules = body["questions"]["operation"]["instructions"]["rules"]
+    assert rules is model.NEXT_ACTION_COMPACT
+    assert rules in body["questions"]["click_target"]["instructions"]["rules"]
+    for constraint in ["untrusted", "Do not repeat satisfied", "Fill required fields", "Never toggle",
+                       "WAIT only if", "DONE needs visible", "BLOCKED"]:
+        assert constraint in rules, constraint
+    assert len(model.NEXT_ACTION_COMPACT) * 3 < len(model.NEXT_ACTION) * 2
+
+
+def test_terse_rules_keep_the_constraints_a_backend_cannot_trim_away(monkeypatch):
+    for constraint in ["untrusted", "Do not repeat satisfied", "Fill required fields",
+                       "DONE needs visible", "BLOCKED"]:
+        assert constraint in model.NEXT_ACTION_TERSE, constraint
+    assert "already" in model.TARGET_TERSE and "offered index" in model.TARGET_TERSE
+
+
+def test_hosted_profile_keeps_the_full_policy_text(monkeypatch):
+    monkeypatch.delenv("TYPESAFE_PROFILE", raising=False)
+    body = sent_body(monkeypatch, page())
+    assert body["questions"]["operation"]["instructions"]["rules"] is model.NEXT_ACTION
+
+
+def test_self_hosted_limit_message_reaches_the_caller(monkeypatch):
+    """jeff names the exact limit it refused; a bare status code leaves the user guessing."""
+    detail = {"detail": [{"msg": "At most 64 options/levels"}]}
+
+    class Refused:
+        status_code = 422
+        headers = {"content-type": "application/json"}
+        is_error = True
+
+        def json(self):
+            return detail
+
+    monkeypatch.setattr(model.CLIENT, "post", Mock(return_value=Refused()))
+    with pytest.raises(RuntimeError, match="At most 64 options/levels"):
+        model.post_json("http://127.0.0.1:8000/v1/systemone", "devkey", {})
+
+
+def test_inspector_numbers_match_what_the_model_saw(monkeypatch):
+    """snapshot() and choose() must rank identically, or the user is shown the wrong elements."""
+    jeff(monkeypatch)
+    p = crowded_page()
+    agent = loop.Agent.__new__(loop.Agent)
+    agent.state = {"page": p, "goal": goals(), "history": [], "decisions": [], "status": "ready"}
+    shown = agent.snapshot()["elements"]
+    sent = sent_body(monkeypatch, p)["state"]["elements"]
+    assert [e["label"] for e in shown] == [e["label"] for e in sent]
+    assert [e["index"] for e in shown] == [e["index"] for e in sent]
+
+
+def test_local_jeff_answers_a_crowded_page_end_to_end(monkeypatch):
+    """Opt-in check against a self-hosted jeff. Never the paid API (AGENTS.md)."""
+    url = os.environ.get("JEV_TEST_JEFF_URL", "http://127.0.0.1:8000")
+    try:
+        health = httpx.get(url + "/healthz", timeout=5)
+        served = health.json() if health.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError):
+        served = {}
+    if not served.get("model"):
+        pytest.skip(f"no jeff server at {url}; set JEV_TEST_JEFF_URL to run this")
+    jeff(monkeypatch)
+    body = sent_body(monkeypatch, crowded_page())
+    body["model"] = "jev-latest"
+    started = time.perf_counter()
+    response = httpx.post(
+        url + "/v1/systemone", json=body, timeout=180,
+        headers={"Authorization": "Bearer " + os.environ.get("JEV_TEST_JEFF_KEY", "devkey")},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["answers"]["operation"]["choice"] in body["questions"]["operation"]["criteria"]
+    print(f"\njeff {served['model']}: {result['usage']} in "
+          f"{round((time.perf_counter() - started) * 1000)}ms")
+
